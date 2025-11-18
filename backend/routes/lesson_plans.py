@@ -7,7 +7,6 @@ from flask import Blueprint, jsonify, request
 
 from lesson_generator import generate_full_course
 from tools.bright_data_tool import scrape_to_txt
-from upload_to_supabase_simple import upload_course_to_supabase
 
 load_dotenv()
 
@@ -25,6 +24,31 @@ headers = {
     'Prefer': 'return=representation'
 }
 
+@lesson_plans_bp.route('/lessons', methods=['GET'])
+def get_lessons():
+    """
+    Fetch all lessons from the generated_course.json file.
+    """
+    try:
+        # Construct the absolute path to the JSON file
+        # Assumes this route file is in backend/routes/
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(current_dir, '..', 'generated_course.json')
+
+        if not os.path.exists(file_path):
+            return jsonify({"status": "error", "message": "generated_course.json not found."}), 404
+
+        with open(file_path, 'r') as f:
+            lessons_data = json.load(f)
+        
+        return jsonify({
+            "status": "success",
+            "count": len(lessons_data),
+            "lessons": lessons_data
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error reading course data: {str(e)}"}), 500
+
 @lesson_plans_bp.route('/generate-lesson-plan', methods=['POST'])
 def generateLessonPlan():
     """Generate a new lesson plan based on input parameters"""
@@ -38,7 +62,6 @@ def generateLessonPlan():
         
         scrape_to_txt(lesson_topic)
         generate_full_course()
-        upload_course_to_supabase()
 
         # Load generated course
         with open('generated_course.json', 'r', encoding='utf-8') as f:
@@ -139,32 +162,4 @@ def generateLessonPlan():
         return jsonify({
             'status': 'error',
             'message': f'Error generating lesson plan: {str(e)}'
-        }), 500
-
-@lesson_plans_bp.route('/lessons', methods=['GET'])
-def get_all_lessons():
-    """Fetch all lessons with their steps"""
-    try:
-        response = requests.get(
-            f'{SUPABASE_URL}/rest/v1/lesson?select=*,step(*)',
-            headers=headers
-        )
-
-        if response.status_code == 200:
-            lessons = response.json()
-            return jsonify({
-                'status': 'success',
-                'count': len(lessons),
-                'lessons': lessons
-            }), 200
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': f'Error fetching lessons: {response.text}'
-            }), response.status_code
-
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Error fetching lessons: {str(e)}'
         }), 500

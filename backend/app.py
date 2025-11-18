@@ -1,18 +1,13 @@
 import os
 import sys
 import base64
-from datetime import datetime
+import logging
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit, join_room
-from utils.learning_agent import (
-    analyze_screenshot,
-    handle_screenshot_event,
-    user_state,
-    generate_and_send_popup_message,
-)
+from utils.learning_agent import handle_screenshot
 from utils.database_context import db_context
+from utils.step_manager import step_manager
 
 # Add the backend directory to Python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -20,8 +15,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 app = Flask(__name__)
 CORS(app)  # Allow React to make requests
 
-# Initialize SocketIO
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Import routes
 from routes import api_routes
@@ -37,6 +33,10 @@ app.register_blueprint(media_bp, url_prefix='/api')
 
 @app.route('/screenshot', methods=['POST'])
 def screenshot():
+    """
+    Handle screenshot analysis with centralized step management.
+    Uses step_manager to track current step and generate contextual help messages.
+    """
     try:
         # Get the request data
         data = request.get_json()
@@ -49,87 +49,139 @@ def screenshot():
 
         # Extract the base64 image data from the request
         base64_image = data['image']
+        user_query = data.get('user_query', '')  # Optional user question
 
         # Optional: Log metadata if provided
         if 'metadata' in data:
             print(f"Screenshot metadata: {data['metadata']}")
 
-        # Determine finish_criteria and lesson_id if provided
-        finish_criteria = data.get('finish_criteria')
-        lesson_id = data.get('lesson_id')
-        step_order = data.get('step_order')
-        user_id = data.get('user_id')
+        # Get current step from centralized step manager
+        lesson_id, step_order = step_manager.get_current_step()
+        
+        # If no current step, initialize with defaults or provided values
+        if lesson_id is None or step_order is None:
+            provided_lesson_id = data.get('lesson_id')
+            provided_step_order = data.get('step_order')
+            lesson_id, step_order = step_manager.initialize(
+                int(provided_lesson_id) if provided_lesson_id else None,
+                int(provided_step_order) if provided_step_order else None
+            )
 
-        # If lesson_id and step_order provided but no explicit finish_criteria, derive via batched fetch
-        if (not finish_criteria) and (lesson_id is not None) and (step_order is not None):
-            try:
-                lesson_id_int = int(lesson_id)
-                step_order_int = int(step_order)
-                lesson_data = db_context.get_lesson_steps_batch(lesson_id_int)
-                if step_order_int in lesson_data:
-                    finish_criteria = lesson_data[step_order_int].get('finish_criteria') or ""
-                else:
-                    finish_criteria = ""
-            except Exception as derive_err:
-                print(f"Warning: failed to derive finish_criteria from lesson data: {derive_err}")
-                finish_criteria = ""
+        # Get step information
+        step_info = step_manager.get_step_info()
+        if not step_info:
+            return jsonify({
+                "message": f"Step {step_order} not found for lesson {lesson_id}",
+                "status": "error"
+            }), 400
+
+        step_description = step_info.get('description', '')
+        
+        # Generate help message using the learning agent
+        help_message = handle_screenshot(
+            base64_image,
+            step_description,
+            user_query
+        )
+
+        return jsonify({
+            "status": "success",
+            "message": help_message,
+            "lesson_id": lesson_id,
+            "step_order": step_order,
+            "step_name": step_info.get('name', '')
+        })
 
     except Exception as e:
+        logger.error(f"Error in screenshot endpoint: {e}")
         return jsonify({
-            "message": f"Error processing request: {str(e)}",
+            "message": f"Error processing screenshot: {str(e)}",
             "status": "error"
-        }), 400
+        }), 500
 
-    # Decide flow: default to progression-aware handler. If explicitly stateless, skip progression.
-    stateless = bool(data.get('stateless', False))
-
-    if not stateless:
-        # Resolve identifiers from data, then from current user_state, then from defaults
-        resolved_user_id = str(user_id or os.getenv("DEFAULT_USER_ID", "default-user"))
-        resolved_lesson_id = lesson_id
-        resolved_step_order = step_order
-
-        if resolved_lesson_id is None or resolved_step_order is None:
-            existing = user_state.get(resolved_user_id)
-            if existing:
-                resolved_lesson_id = existing.get("lesson_id")
-                resolved_step_order = existing.get("step_order")
-
-        if resolved_lesson_id is None or resolved_step_order is None:
-            # Fallback to defaults (lesson 1, step 1) or environment overrides
-            resolved_lesson_id = int(os.getenv("DEFAULT_LESSON_ID", "1"))
-            resolved_step_order = 1
-
-        try:
-            progression_result = handle_screenshot_event(
-                resolved_user_id,
-                int(resolved_lesson_id),
-                int(resolved_step_order),
-                base64_image,
-            )
-            return jsonify({
-                "status": "success",
-                **progression_result
-            })
-        except Exception as event_err:
-            return jsonify({
-                "message": f"Event handling failed: {str(event_err)}",
-                "status": "error"
-            }), 500
-
-    # Stateless analysis path: compute completion and return
+@app.route('/api/help-tip', methods=['POST'])
+def get_help_tip():
+    """
+    Generate a help tip based on user's query and screenshot.
+    Uses the current step context from step_manager.
+    
+    Expected JSON payload:
+    {
+        "image": "base64_encoded_screenshot",
+        "user_query": "User's question or request for help"
+    }
+    """
     try:
-        analysis = analyze_screenshot(base64_image, finish_criteria or "", lesson_id)
-        completed = str(analysis).strip().upper() == "YES"
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                "message": "No data provided",
+                "status": "error"
+            }), 400
+        
+        # Validate required fields
+        if 'image' not in data:
+            return jsonify({
+                "message": "No image data provided",
+                "status": "error"
+            }), 400
+        
+        if 'user_query' not in data or not data.get('user_query', '').strip():
+            return jsonify({
+                "message": "No user query provided",
+                "status": "error"
+            }), 400
+        
+        # Extract data
+        base64_image = data['image']
+        user_query = data['user_query'].strip()
+        conversation_history = data.get('conversation_history', []) # Extract conversation history
+        
+        # Get current step from centralized step manager
+        lesson_id, step_order = step_manager.get_current_step()
+        
+        # If no current step, initialize with defaults or provided values
+        if lesson_id is None or step_order is None:
+            provided_lesson_id = data.get('lesson_id')
+            provided_step_order = data.get('step_order')
+            lesson_id, step_order = step_manager.initialize(
+                int(provided_lesson_id) if provided_lesson_id else None,
+                int(provided_step_order) if provided_step_order else None
+            )
+        
+        # Get step information
+        step_info = step_manager.get_step_info()
+        if not step_info:
+            return jsonify({
+                "message": f"Step {step_order} not found for lesson {lesson_id}",
+                "status": "error"
+            }), 400
+        
+        step_description = step_info.get('description', '')
+        
+        # Generate help tip using the learning agent chain
+        help_tip = handle_screenshot(
+            base64_image,
+            step_description,
+            user_query,
+            conversation_history # Pass history to the agent
+        )
+        
         return jsonify({
-            "message": "Screenshot analyzed successfully",
             "status": "success",
-            "analysis": analysis,
-            "completed": completed
+            "help_tip": help_tip,
+            "user_query": user_query,
+            "lesson_id": lesson_id,
+            "step_order": step_order,
+            "step_name": step_info.get('name', ''),
+            "step_description": step_description
         })
-    except Exception as analyze_err:
+        
+    except Exception as e:
+        logger.error(f"Error in get_help_tip endpoint: {e}")
         return jsonify({
-            "message": f"Analysis failed: {str(analyze_err)}",
+            "message": f"Error generating help tip: {str(e)}",
             "status": "error"
         }), 500
 
@@ -148,140 +200,170 @@ def health():
         "service": "calhacks2025-backend"
     })
 
-## Removed consolidated event endpoint; use /screenshot only
+## Step Management Endpoints
+
+@app.route('/api/current-step', methods=['GET'])
+def get_current_step():
+    """
+    Get the current step information.
+    """
+    try:
+        lesson_id, step_order = step_manager.get_current_step()
+        
+        if lesson_id is None or step_order is None:
+            return jsonify({
+                "status": "success",
+                "message": "No current step set",
+                "lesson_id": None,
+                "step_order": None
+            })
+        
+        step_info = step_manager.get_step_info()
+        
+        return jsonify({
+            "status": "success",
+            "lesson_id": lesson_id,
+            "step_order": step_order,
+            "step_info": step_info,
+            "popup_sent": step_manager.has_popup_been_sent()
+        })
+    except Exception as e:
+        logger.error(f"Error in get_current_step: {e}")
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to get current step: {str(e)}"
+        }), 500
+
+@app.route('/api/advance-step', methods=['POST'])
+def advance_step():
+    """
+    Advance to the next step in the current lesson.
+    """
+    try:
+        lesson_id, next_step_order, has_next = step_manager.advance_to_next_step()
+        
+        if not has_next:
+            if next_step_order is None and lesson_id:
+                # Lesson completed
+                return jsonify({
+                    "status": "success",
+                    "message": "Lesson completed!",
+                    "lesson_id": lesson_id,
+                    "lesson_completed": True
+                })
+            else:
+                # No current step
+                return jsonify({
+                    "status": "error",
+                    "message": "No current step to advance from"
+                }), 400
+        
+        # Get new step info
+        step_info = step_manager.get_step_info()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Advanced to next step",
+            "lesson_id": lesson_id,
+            "step_order": next_step_order,
+            "step_info": step_info
+        })
+    except Exception as e:
+        logger.error(f"Error in advance_step: {e}")
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to advance step: {str(e)}"
+        }), 500
+
+@app.route('/api/previous-step', methods=['POST'])
+def previous_step():
+    """
+    Go to the previous step in the current lesson.
+    """
+    try:
+        lesson_id, previous_step_order, has_previous = step_manager.go_to_previous_step()
+        
+        if not has_previous:
+            if previous_step_order is None and lesson_id:
+                # Already at first step
+                return jsonify({
+                    "status": "success",
+                    "message": "Already at first step of lesson",
+                    "lesson_id": lesson_id,
+                    "at_first_step": True
+                })
+            else:
+                # No current step
+                return jsonify({
+                    "status": "error",
+                    "message": "No current step to go back from"
+                }), 400
+        
+        # Get new step info
+        step_info = step_manager.get_step_info()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Went back to previous step",
+            "lesson_id": lesson_id,
+            "step_order": previous_step_order,
+            "step_info": step_info
+        })
+    except Exception as e:
+        logger.error(f"Error in previous_step: {e}")
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to go to previous step: {str(e)}"
+        }), 500
 
 # Explicit start endpoint to trigger popup and set state before first screenshot
 @app.route('/api/start-step', methods=['POST'])
 def start_step():
+    """
+    Initialize or set a step. Uses centralized step manager.
+    """
     try:
         data = request.get_json(silent=True) or {}
-
-        resolved_user_id = str(data.get('user_id') or os.getenv("DEFAULT_USER_ID", "default-user"))
         lesson_id = data.get('lesson_id')
         step_order = data.get('step_order')
 
-        # If not provided, derive from current state or defaults
-        existing = user_state.get(resolved_user_id)
-        if lesson_id is None:
-            lesson_id = existing.get('lesson_id') if existing else int(os.getenv("DEFAULT_LESSON_ID", "1"))
-        if step_order is None:
-            step_order = existing.get('step_order') if existing else 1
+        # Initialize step using step manager
+        final_lesson_id, final_step_order = step_manager.initialize(
+            int(lesson_id) if lesson_id else None,
+            int(step_order) if step_order else None
+        )
 
-        lesson_id = int(lesson_id)
-        step_order = int(step_order)
-
-        # Load lesson data and send popup for current step
-        lesson_data = db_context.get_lesson_steps_batch(lesson_id)
-        if step_order not in lesson_data:
+        # Get step information
+        step_info = step_manager.get_step_info()
+        if not step_info:
             return jsonify({
                 "status": "error",
-                "message": f"Step {step_order} not found for lesson {lesson_id}"
+                "message": f"Step {final_step_order} not found for lesson {final_lesson_id}"
             }), 400
 
-        step_description = lesson_data[step_order].get('description') or ""
-        generate_and_send_popup_message("", step_description, resolved_user_id)
-
-        # Update state to indicate popup already sent for this step
-        state = user_state.setdefault(resolved_user_id, {"lesson_id": lesson_id, "step_order": step_order, "popup_sent_for_step": True})
-        state["lesson_id"] = lesson_id
-        state["step_order"] = step_order
-        state["popup_sent_for_step"] = True
+        step_description = step_info.get('description', '')
+        
+        # Mark popup as sent
+        step_manager.mark_popup_sent()
 
         return jsonify({
             "status": "success",
-            "message": "Step initialized and popup sent",
-            "user_id": resolved_user_id,
-            "lesson_id": lesson_id,
-            "step_order": step_order
+            "message": "Step initialized",
+            "lesson_id": final_lesson_id,
+            "step_order": final_step_order,
+            "step_name": step_info.get('name', ''),
+            "step_description": step_description
         })
     except Exception as e:
+        logger.error(f"Error in start_step: {e}")
         return jsonify({
             "status": "error",
             "message": f"Failed to start step: {str(e)}"
         }), 500
 
-# WebSocket API endpoint for sending popup messages
-@app.route('/api/send-popup', methods=['POST'])
-def send_popup():
-    """
-    API endpoint to send popup messages via WebSocket to connected clients.
-    
-    Expected JSON payload:
-    {
-        "message": "Popup message text",
-        "type": "popup",
-        "user_id": "optional_user_id",
-        "timestamp": "optional_timestamp"
-    }
-    """
-    try:
-        data = request.get_json()
-        
-        if not data or 'message' not in data:
-            return jsonify({
-                "message": "No message provided",
-                "status": "error"
-            }), 400
-        
-        # Extract popup data
-        popup_message = data['message']
-        popup_type = data.get('type', 'popup')
-        user_id = data.get('user_id')
-        timestamp = data.get('timestamp', datetime.now().isoformat())
-        
-        # Prepare the popup data to send
-        popup_data = {
-            "message": popup_message,
-            "type": popup_type,
-            "timestamp": timestamp,
-            "user_id": user_id
-        }
-        
-        # Send popup to all connected clients or specific user
-        if user_id:
-            # Send to specific user (if user rooms are implemented)
-            socketio.emit('popup_message', popup_data, room=user_id)
-            print(f"Popup sent to user {user_id}: {popup_message[:50]}...")
-        else:
-            # Send to all connected clients
-            socketio.emit('popup_message', popup_data)
-            print(f"Popup broadcasted to all clients: {popup_message[:50]}...")
-        
-        return jsonify({
-            "message": "Popup sent successfully",
-            "status": "success",
-            "popup_data": popup_data
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "message": f"Error sending popup: {str(e)}",
-            "status": "error"
-        }), 500
 
-# WebSocket event handlers
-@socketio.on('connect')
-def handle_connect():
-    """Handle client connection"""
-    print(f"Client connected: {request.sid}")
-    emit('status', {'message': 'Connected to popup service'})
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    """Handle client disconnection"""
-    print(f"Client disconnected: {request.sid}")
-
-@socketio.on('join_user_room')
-def handle_join_user_room(data):
-    """Handle user joining their specific room for targeted messaging"""
-    user_id = data.get('user_id')
-    if user_id:
-        join_room(user_id)
-        print(f"User {user_id} joined room")
-        emit('status', {'message': f'Joined room for user {user_id}'})
 
 if __name__ == '__main__':
-    print("Starting Flask backend with WebSocket support...")
+    print("Starting Flask backend...")
     print("Backend will be available at: http://localhost:5000")
-    print("WebSocket endpoint: ws://localhost:5000/socket.io/")
-    socketio.run(app, debug=True, port=5000, host='127.0.0.1', allow_unsafe_werkzeug=True)
+    app.run(debug=True, port=5000, host='127.0.0.1')

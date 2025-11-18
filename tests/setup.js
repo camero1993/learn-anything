@@ -35,8 +35,10 @@ Object.defineProperty(window, 'electronAPI', {
   value: {
     triggerChildProcess: jest.fn(() => Promise.resolve({ success: true })),
     onChildProcessOutput: jest.fn(),
-    getBackendStatus: jest.fn(() => Promise.resolve({ isRunning: true })),
-    restartBackend: jest.fn(() => Promise.resolve({ success: true }))
+    takeScreenshot: jest.fn(() => Promise.resolve({ success: true, data: 'mock' })),
+    onOverlaySetContent: jest.fn(),
+    platform: 'darwin',
+    appVersion: '1.0.0'
   },
   writable: true
 });

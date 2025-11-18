@@ -1,8 +1,25 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import "./Home.css";
+import { getLessons } from "../services/apiService";
 
 const Home = () => {
   const [isSubmitted, setIsSubmitted] = useState(false);
+  const [lessons, setLessons] = useState([]);
+  const [topic, setTopic] = useState("");
+
+  useEffect(() => {
+    const fetchLessons = async () => {
+      try {
+        const data = await getLessons();
+        if (data.status === 'success') {
+          setLessons(data.lessons);
+        }
+      } catch (error) {
+        console.error("Failed to fetch lessons:", error);
+      }
+    };
+    fetchLessons();
+  }, []);
 
   const handleSubmit = () => {
     setIsSubmitted(true);
@@ -11,7 +28,7 @@ const Home = () => {
   const handleTriggerChildProcess = async () => {
     if (window.electronAPI) {
       try {
-        const result = await window.electronAPI.triggerChildProcess();
+        await window.electronAPI.triggerChildProcess();
       } catch (error) {
         console.error("Error triggering child process: ", error);
       }
@@ -19,19 +36,6 @@ const Home = () => {
       console.error("Not running in Electron environment");
     }
   };
-
-  const lessonItems = [
-    "Understanding the Figma interface, including the toolbar, layers panel, properties panel, and how to navigate the canvas effectively.",
-    "Creating and manipulating basic shapes, using selection tools, and applying transformations like rotation, scaling, and positioning.",
-    "Working with frames and artboards to organize your designs and create responsive layouts for different screen sizes.",
-    "Mastering text tools, typography settings, and text styling to create readable and visually appealing content.",
-    "Using the pen tool and vector editing capabilities to create custom shapes, icons, and illustrations.",
-    "Applying colors, gradients, and effects like shadows, blurs, and strokes to enhance your designs.",
-    "Creating and managing components and variants to build reusable design elements and maintain consistency across projects.",
-    "Understanding auto layout to create flexible, responsive designs that automatically adjust to content changes.",
-    "Using prototyping features to connect frames, add interactions, and create clickable mockups that simulate user flows.",
-    "Collaborating with team members through commenting, sharing files, and using version history to track design changes.",
-  ];
 
   if (isSubmitted) {
     return (
@@ -61,13 +65,13 @@ const Home = () => {
                 color: "#2d2d2d",
                 paddingLeft: 30,
               }}>
-              {lessonItems.map((lesson, index) => (
+              {lessons.map((lesson) => (
                 <li
-                  key={index}
+                  key={lesson.lesson_id}
                   style={{
                     marginBottom: 24,
                   }}>
-                  {lesson}
+                  <strong>{lesson.name}:</strong> {lesson.description}
                 </li>
               ))}
             </ol>
@@ -146,7 +150,9 @@ const Home = () => {
           }}>
           <input
             type="text"
-            placeholder="Ask anything"
+            placeholder="What do you want to learn today?"
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
             style={{
               width: "100%",
               height: 144,

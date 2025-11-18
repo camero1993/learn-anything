@@ -5,16 +5,174 @@ const {
   globalShortcut,
   desktopCapturer,
   screen,
+  protocol,
 } = require("electron");
 const path = require("path");
 const { spawn } = require("child_process");
-const mouseHook = require("mac-mouse-hook");
+const fs = require("fs");
 
-let mainWindow;
+let mainWindow = null; // Track the main window
 let overlayWindow = null; // Track the overlay window
 
-// Mouse hook state
-let isMouseHookActive = false;
+// Serve static files from build directory
+function setupStaticFileServing() {
+  const frontendBuildPath = path.join(__dirname, "frontend/build");
+  const overlayBuildPath = path.join(__dirname, "overlay-screen/build");
+  
+  protocol.interceptFileProtocol("file", (request, callback) => {
+    let url = request.url.substr(7); // Remove 'file://'
+    
+    // Handle Windows file paths (file:///C:/path)
+    if (process.platform === "win32" && url.match(/^\/[A-Z]:/)) {
+      url = url.substr(1);
+    }
+    
+    // Log all file requests for debugging
+    if (url.includes("static") || url.includes(".js") || url.includes(".css")) {
+      console.log(`[Protocol] Request: ${request.url} -> ${url}`);
+    }
+    
+    // Check if this is a request for a static asset with absolute path (starts with /static/)
+    // When HTML references /static/css/file.css, browser requests file:///static/css/file.css
+    if (url.startsWith("/static/")) {
+      // Remove leading slash and build the path
+      const relativePath = url.replace(/^\/+/, "");
+      
+      // Try frontend build first, then overlay build
+      let filePath = path.join(frontendBuildPath, relativePath);
+      let normalizedPath = path.normalize(filePath);
+      if (fs.existsSync(normalizedPath)) {
+        callback({ path: normalizedPath });
+        return;
+      }
+      
+      // Try overlay build
+      filePath = path.join(overlayBuildPath, relativePath);
+      normalizedPath = path.normalize(filePath);
+      if (fs.existsSync(normalizedPath)) {
+        console.log(`[Protocol] Serving overlay static: ${relativePath}`);
+        callback({ path: normalizedPath });
+        return;
+      }
+      
+      // Log for debugging
+      console.error(`[Protocol] Static file not found: ${relativePath}`);
+      console.error(`[Protocol] Tried: ${path.join(frontendBuildPath, relativePath)}`);
+      console.error(`[Protocol] Tried: ${path.join(overlayBuildPath, relativePath)}`);
+    }
+    
+    // Check for other absolute paths that might be in the build directory
+    // (like /manifest.json, /favicon.ico, etc.)
+    if (url.startsWith("/") && !url.includes(":") && !path.isAbsolute(url)) {
+      const relativePath = url.replace(/^\/+/, "");
+      
+      // Try frontend build first, then overlay build
+      let filePath = path.join(frontendBuildPath, relativePath);
+      let normalizedPath = path.normalize(filePath);
+      if (fs.existsSync(normalizedPath)) {
+        callback({ path: normalizedPath });
+        return;
+      }
+      
+      // Try overlay build
+      filePath = path.join(overlayBuildPath, relativePath);
+      normalizedPath = path.normalize(filePath);
+      if (fs.existsSync(normalizedPath)) {
+        callback({ path: normalizedPath });
+        return;
+      }
+    }
+    
+    // Default: pass through to original handler (for the actual index.html file)
+    callback({ path: url });
+  });
+}
+
+// Create main window function
+function createMainWindow() {
+  // Check if main window already exists
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.focus();
+    return mainWindow;
+  }
+
+  console.log("Creating main window");
+
+  // Create the main window
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    minWidth: 800,
+    minHeight: 600,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, "preload.js"),
+      webSecurity: false,
+    },
+    title: "CalHacks 2025",
+    show: false, // Don't show until ready
+  });
+
+  // Load content for the main window
+  const isDev = !app.isPackaged;
+
+  if (isDev) {
+    // In development, try dev server first; fallback to built files if it fails
+    mainWindow.loadURL("http://localhost:3000").catch(() => {
+      console.log(
+        "Frontend dev server not available; falling back to built files"
+      );
+      mainWindow.loadFile(
+        path.join(__dirname, "frontend/build/index.html")
+      );
+    });
+
+    // Also handle async load failures
+    mainWindow.webContents.on(
+      "did-fail-load",
+      (_event, _errorCode, _errorDescription, validatedURL) => {
+        if (validatedURL && validatedURL.startsWith("http://localhost:3000")) {
+          console.log(
+            "Frontend failed to load dev server; loading built files instead"
+          );
+          mainWindow.loadFile(
+            path.join(__dirname, "frontend/build/index.html")
+          );
+        }
+      }
+    );
+  } else {
+    // In production, load the built React app
+    mainWindow.loadFile(
+      path.join(__dirname, "frontend/build/index.html")
+    );
+  }
+
+  // Show window when ready
+  mainWindow.webContents.once("did-finish-load", () => {
+    mainWindow.show();
+    console.log("Main window opened");
+    // Open DevTools in development to debug
+    if (!app.isPackaged) {
+      mainWindow.webContents.openDevTools();
+    }
+  });
+
+  // Log any failed resource loads
+  mainWindow.webContents.on("did-fail-load", (event, errorCode, errorDescription, validatedURL) => {
+    console.error(`Failed to load: ${validatedURL}`);
+    console.error(`Error: ${errorCode} - ${errorDescription}`);
+  });
+
+  // Handle main window closed
+  mainWindow.on("closed", () => {
+    console.log("Main window closed");
+    mainWindow = null;
+  });
+
+  return mainWindow;
+}
 
 // Overlay screen function triggered by '/' key - creates a new Electron window
 function triggerOverlayScreen() {
@@ -37,8 +195,6 @@ function triggerOverlayScreen() {
     minWidth: 200,
     minHeight: 150,
     // backgroundColor: "#00000000", // Fully transparent if needed
-    // Remove parent property to make it independent
-    // parent: mainWindow, // Removed - now independent
     // modal: false, // Not needed for independent window
     alwaysOnTop: true, // Keep it above other windows
     frame: false, // Frameless window required for transparency on macOS
@@ -61,11 +217,9 @@ function triggerOverlayScreen() {
   if (isDev) {
     // In development, try dev server first; fallback to built files if it fails
     overlayWindow.loadURL("http://localhost:3001").catch(() => {
-      console.log(
-        "Overlay dev server not available; falling back to built files"
-      );
+      // Silently fallback to built files - this is expected behavior
       overlayWindow.loadFile(
-        path.join(__dirname, "overlay-screen/public/index.html")
+        path.join(__dirname, "overlay-screen/build/index.html")
       );
     });
 
@@ -74,11 +228,9 @@ function triggerOverlayScreen() {
       "did-fail-load",
       (_event, _errorCode, _errorDescription, validatedURL) => {
         if (validatedURL && validatedURL.startsWith("http://localhost:3001")) {
-          console.log(
-            "Overlay failed to load dev server; loading built files instead"
-          );
+          // Silently fallback to built files - this is expected behavior
           overlayWindow.loadFile(
-            path.join(__dirname, "overlay-screen/public/index.html")
+            path.join(__dirname, "overlay-screen/build/index.html")
           );
         }
       }
@@ -86,7 +238,7 @@ function triggerOverlayScreen() {
   } else {
     // In production, load the built React app
     overlayWindow.loadFile(
-      path.join(__dirname, "overlay-screen/public/index.html")
+      path.join(__dirname, "overlay-screen/build/index.html")
     );
   }
 
@@ -94,12 +246,32 @@ function triggerOverlayScreen() {
   overlayWindow.webContents.once("did-finish-load", () => {
     overlayWindow.show();
     console.log("Overlay window opened");
+    
+    // Open DevTools for overlay in development to debug
+    if (!app.isPackaged) {
+      overlayWindow.webContents.openDevTools();
+    }
 
     // Send initial content to overlay renderer
     overlayWindow.webContents.send("overlay-set-content", {
       header: "Step 1",
       body: "Using prototyping features to connect frames, add interactions, and create clickable mockups that simulate user flows.",
     });
+  });
+  
+  // Log console messages from overlay window
+  overlayWindow.webContents.on("console-message", (event, level, message, line, sourceId) => {
+    console.log(`[Overlay ${level}] ${message}`);
+  });
+
+  // Log any failed resource loads for overlay
+  overlayWindow.webContents.on("did-fail-load", (event, errorCode, errorDescription, validatedURL) => {
+    console.error(`Overlay failed to load: ${validatedURL}`);
+    console.error(`Error: ${errorCode} - ${errorDescription}`);
+    // Still try to show the window even if load failed
+    if (!overlayWindow.isDestroyed()) {
+      overlayWindow.show();
+    }
   });
 
   // Handle overlay window closed
@@ -108,138 +280,19 @@ function triggerOverlayScreen() {
     overlayWindow = null; // Reset the reference when closed
   });
 
-  // Send message to main window that overlay was created
-  if (mainWindow) {
-    mainWindow.webContents.send(
-      "child-process-output",
-      "Overlay window created"
-    );
-  }
-
   return overlayWindow;
-}
-
-// Mouse hook functions
-function startMouseMonitoring() {
-  if (isMouseHookActive) {
-    console.log("Mouse hook already active");
-    return;
-  }
-
-  try {
-    mouseHook.start((event) => {
-      // Print coordinates and timestamp
-      console.log(
-        `Mouse click: x=${event.x}, y=${
-          event.y
-        }, timestamp=${new Date().toISOString()}`
-      );
-
-      // Trigger action on every click
-      triggerDebugAction(event);
-    });
-
-    isMouseHookActive = true;
-  } catch (error) {
-    console.error("Failed to start mouse hook:", error.message);
-
-    if (error.message.includes("Accessibility permissions")) {
-      console.log(
-        "Please enable accessibility permissions in System Preferences > Security & Privacy > Privacy > Accessibility"
-      );
-    }
-  }
-}
-
-function stopMouseMonitoring() {
-  if (!isMouseHookActive) {
-    return;
-  }
-
-  try {
-    mouseHook.stop();
-    isMouseHookActive = false;
-  } catch (error) {
-    console.error("Failed to stop mouse hook:", error.message);
-  }
-}
-
-function triggerDebugAction(lastEvent) {
-  console.log(
-    `Action triggered: x=${lastEvent.x}, y=${
-      lastEvent.y
-    }, timestamp=${new Date().toISOString()}`
-  );
-
-  // Send debug message to main window if it exists
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("mouse-hook-debug", {
-      action: "click-detected",
-      clickData: lastEvent,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  // Send debug message to overlay window if it exists
-  if (overlayWindow && !overlayWindow.isDestroyed()) {
-    overlayWindow.webContents.send("mouse-hook-debug", {
-      action: "click-detected",
-      clickData: lastEvent,
-      timestamp: new Date().toISOString(),
-    });
-  }
-}
-
-function createWindow() {
-  // Create the browser window
-  mainWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    minWidth: 800,
-    minHeight: 600,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: path.join(__dirname, "preload.js"),
-      webSecurity: false, // Allow localhost requests
-    },
-    icon: path.join(__dirname, "assets/icon.png"), // Optional: add an icon
-    show: false, // Don't show until ready
-  });
-
-  // Backend is managed externally; no backend process started here
-
-  // Load the React app
-  const isDev = !app.isPackaged;
-
-  if (isDev) {
-    // In development, load from React dev server
-    mainWindow.loadURL("http://localhost:3000");
-  } else {
-    // In production, load from built React app
-    mainWindow.loadFile(path.join(__dirname, "frontend/public/index.html"));
-  }
-
-  // Show window when ready
-  mainWindow.once("ready-to-show", () => {
-    mainWindow.show();
-  });
-
-  // Handle window closed
-  mainWindow.on("closed", () => {
-    mainWindow = null;
-  });
-
-  // Handle external links
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    require("electron").shell.openExternal(url);
-    return { action: "deny" };
-  });
 }
 
 // This method will be called when Electron has finished initialization
 app.whenReady().then(() => {
-  createWindow();
+  // Set up static file serving - must be called after app is ready
+  setupStaticFileServing();
+  
+  // Small delay to ensure protocol is registered before creating window
+  setTimeout(() => {
+    // Create the main window on startup
+    createMainWindow();
+  }, 100);
 
   // // Register global shortcut for '/' key
   // // Toggle behavior: creates overlay if none exists, closes it if it exists
@@ -252,13 +305,10 @@ app.whenReady().then(() => {
   //   console.log('Registration of global shortcut "/" failed');
   // }
 
-  // Start mouse monitoring automatically
-  startMouseMonitoring();
-
+  // On macOS, recreate window when dock icon is clicked
   app.on("activate", () => {
-    // On macOS, re-create window when dock icon is clicked
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+      createMainWindow();
     }
   });
 });
@@ -269,6 +319,11 @@ app.on("window-all-closed", () => {
   if (overlayWindow && !overlayWindow.isDestroyed()) {
     overlayWindow.close();
     overlayWindow = null;
+  }
+
+  // Close main window if it exists
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow = null;
   }
 
   // Unregister all global shortcuts
@@ -282,15 +337,15 @@ app.on("window-all-closed", () => {
 
 // Handle app before quit to ensure proper cleanup
 app.on("before-quit", () => {
-  // Stop mouse monitoring
-  if (isMouseHookActive) {
-    stopMouseMonitoring();
-  }
-
   // Close overlay window if it exists
   if (overlayWindow && !overlayWindow.isDestroyed()) {
     overlayWindow.close();
     overlayWindow = null;
+  }
+  // Close main window if it exists
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.close();
+    mainWindow = null;
   }
 });
 
@@ -301,11 +356,6 @@ app.on("web-contents-created", (event, contents) => {
     require("electron").shell.openExternal(navigationUrl);
   });
 });
-
-// IPC handlers for communication with renderer process
-ipcMain.handle("get-backend-status", () => ({ isRunning: false }));
-
-ipcMain.handle("restart-backend", () => ({ success: false }));
 
 // IPC handler to trigger overlay screen from renderer
 ipcMain.handle("trigger-child-process", () => {
@@ -361,26 +411,3 @@ ipcMain.handle("take-screenshot", async () => {
   }
 });
 
-// Mouse hook IPC handlers
-ipcMain.handle("start-mouse-monitoring", () => {
-  startMouseMonitoring();
-  return { success: true, active: isMouseHookActive };
-});
-
-ipcMain.handle("stop-mouse-monitoring", () => {
-  stopMouseMonitoring();
-  return { success: true, active: isMouseHookActive };
-});
-
-ipcMain.handle("get-mouse-hook-status", () => {
-  return {
-    active: isMouseHookActive,
-  };
-});
-
-// Handle app activation (macOS)
-app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
-  }
-});
